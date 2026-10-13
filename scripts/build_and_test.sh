@@ -12,7 +12,7 @@ run_mode() {
     local dir="build/$mode"
     cmake -S . -B "$dir" -DCMAKE_BUILD_TYPE=Release "$@"
     cmake --build "$dir" -j
-    if "$dir/test_pool"; then
+    if "$dir/test_pool" && "$dir/stress_mix"; then
         echo "== $mode: 全绿 =="
     else
         echo "== $mode: 测试未全绿 ==" >&2

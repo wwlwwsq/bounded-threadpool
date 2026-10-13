@@ -44,6 +44,12 @@ if(BPOOL_BUILD_TESTS)
     target_link_libraries(test_pool PRIVATE bpool)
     apply_sanitizers(test_pool)
     add_test(NAME spec COMMAND test_pool)
+
+    # 混合压力：TSan 模式下与 test_pool 同为重点观察对象
+    add_executable(stress_mix tests/stress_mix.cpp)
+    target_link_libraries(stress_mix PRIVATE bpool)
+    apply_sanitizers(stress_mix)
+    add_test(NAME stress_mix COMMAND stress_mix)
 endif()
 
 if(BPOOL_BUILD_BENCH)
