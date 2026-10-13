@@ -82,12 +82,13 @@ void ThreadPool::worker_loop() {
             std::unique_lock<std::mutex> lk(mu_);
             cv_not_empty_.wait(lk, [&] { return !tasks_.empty() || closed_; });
             if (closed_ && (cancel_ || tasks_.empty())) break;  // 退出前先登记（见循环外）
-            // D3: pop 后立刻让出空位通知（而非任务执行完之后），生产者尽早拿到空位；
-            //    仅在队列原本满时通知——谓词等待保证多通知无害，但白付一次系统调用
-            const bool was_full = tasks_.size() >= opts_.queue_capacity;
+            // D3: pop 后立即通知（而非任务执行完之后），生产者尽早拿到空位。
+            //    必须每次 pop 都 notify_one 与空位一一配对——曾尝试「仅队列原本满时
+            //    才通知」省系统调用，但多提交者堆积睡眠后队列被排空时会丢唤醒死锁
+            //    （stress_mix 首轮捕获）。谓词等待救不了缺失的通知
             task = std::move(tasks_.front());
             tasks_.pop_front();
-            if (was_full) cv_not_full_.notify_one();
+            cv_not_full_.notify_one();
         }  // 解锁后再执行任务，临界区只覆盖队列操作
         try {
             task();  // post 路径异常在此吞掉；submit 路径异常已被 packaged_task 存入 future

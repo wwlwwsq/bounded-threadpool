@@ -10,7 +10,8 @@ C++17 有界队列线程池：单锁基线版 `ThreadPool` 与分片优化版 `S
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ./build/test_pool            # 规格测试（11 条用例，全绿退出码 0）
-./build/bench_pool 1000000   # 吞吐基准，输出 markdown 表行
+./build/stress_mix           # 混合压力：并发 post/submit × 三策略 × 并发 shutdown，计数守恒
+./build/bench_pool 1000000 5 # 吞吐基准（任务数 reps），输出 markdown 表行（取中位）
 bash scripts/build_and_test.sh   # 常规 + ASan + TSan 三连（Linux/WSL2）
 ```
 
@@ -43,7 +44,7 @@ g++ -std=c++17 -O1 -g -fsanitize=undefined -fsanitize-undefined-trap-on-error -p
 
 - **D1 关闭时阻塞中的提交者**：`kBlock` 的 post 在 `closed_` 置位后被唤醒，必须抛 `PoolClosedError`，任务**不入队不执行**。丢任务是正确行为：若放它入队，`shutdown(true)`「返回即全部完成」的契约要么被破坏、要么永远等不到（提交者可能仍卡在满队列上）。任务还握在提交者手里，用异常通知它自行决定重试或放弃，比悄悄排队更可控。
 - **D2 caller-runs 计数语义**（已定稿）：同步执行的任务 `submitted++` **且** `completed++`——`completed` 的语义是「执行完毕的任务数」，与执行线程无关；stats 不因线程不同而双标（test_stats_counters 不涉及 caller-runs，断言自洽）。
-- **D3 worker 在 pop 之后（而非执行完之后）notify_not_full**：空位在任务执行前就对生产者可见，任务执行期间生产者可并行入队，吞吐关键路径更短。只在「队列原本满」时通知：谓词等待保证多通知无害，但每次 notify 是一次系统调用，空通知白费；notify_one 精确唤醒一个，不会惊群。
+- **D3 worker 在 pop 之后（而非执行完之后）notify_not_full**：空位在任务执行前就对生产者可见，任务执行期间生产者可并行入队，吞吐关键路径更短。**每次 pop 都 notify_one，与让出的空位一一配对**——曾实现「仅当队列原本满时才通知」想省一次系统调用，被 stress_mix 首轮捕获死锁：多个提交者在满队时堆积睡眠、队列随后被连续消费排空时，只有第一个拿到通知，其余提交者谓词已真（有空位）却无人唤醒，永久睡眠。教训：谓词等待只能容忍**多余**通知，救不了**缺失**的通知。
 - **D4 分片不偷任务**：worker 只消费绑定 shard，队头倾斜时负载不均。轮转选片在任务粒度均匀时倾斜有限（见数据表）；倾斜敏感场景的出路是「选最浅片」或 work-stealing（§6 加分项，用数据说话）。
 - **D5 shutdown(false) 丢弃任务的 future 状态**（修正后定稿）：实现必须在 `shutdown(false)` 内**就地清空队列**——被丢弃任务里的 `packaged_task` 随之销毁，对应 future 立即以 `std::future_error(broken_promise)` 就绪。若不清队，future 要等到池析构才打破，期间 `get()` 永久阻塞（原方案描述的行为与骨架代码不符，已修正并用 test_shutdown_discard_breaks_futures 机器验证）。
 - **D6 每个 shard 至少一个 worker**：`num_shards > num_workers` 时，无消费者的 shard 任务永远不被执行、drain 卡死。构造时 worker 数取 `max(num_workers, num_shards)`。

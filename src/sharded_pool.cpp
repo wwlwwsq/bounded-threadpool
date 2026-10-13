@@ -68,10 +68,10 @@ void ShardedThreadPool::worker_loop(size_t shard_idx) {
             if (closed_.load(std::memory_order_relaxed) &&
                 (cancel_.load(std::memory_order_relaxed) || s.tasks.empty()))
                 break;
-            const bool was_full = s.tasks.size() >= opts_.queue_capacity;
+            // 同 D3：每 pop 一次 notify_one 与空位配对，「仅满队才通知」会丢唤醒死锁
             task = std::move(s.tasks.front());
             s.tasks.pop_front();
-            if (was_full) s.cv_not_full.notify_one();
+            s.cv_not_full.notify_one();
         }
         try {
             task();

@@ -78,7 +78,7 @@
 
 - **D1 关闭时阻塞中的提交者**：kBlock 的 post 在 `closed_` 后醒来必须抛 `PoolClosedError`，任务不入队不执行——"丢任务才是正确行为"（否则 shutdown 永远等不到，或排空契约被破坏）。
 - **D2 caller-runs 计数语义**（已定稿）：`submitted++` 与 `completed++` 都计——completed 的字面语义是「执行完毕的任务数」，与执行线程无关。
-- **D3 为什么 worker 在 pop 之后（而非执行完之后）notify_not_full**：让生产者尽早拿到空位，任务执行期间生产者可并行入队；仅在队列原本满时通知（notify 是一次系统调用，谓词等待保证多通知无害但白费）。
+- **D3 为什么 worker 在 pop 之后（而非执行完之后）notify_not_full**：让生产者尽早拿到空位，任务执行期间生产者可并行入队。**每次 pop 必须 notify_one 与空位一一配对**：「仅队列原本满时才通知」的省调用优化会被 stress_mix 捕获死锁（多提交者堆积睡眠→队列排空→谓词已真却无人唤醒）——谓词等待救不了缺失的通知（2026-10-13 实测踩坑，已回退）。
 - **D4 分片不偷任务**：worker 只消费绑定 shard，队头倾斜时负载不均——量化说明这个简化在什么负载下可接受（bench 数据支撑，M4）。
 - **D5 shutdown(false) 丢弃任务的 future 状态**（修正后定稿）：**必须在 shutdown(false) 内就地清空队列**，被丢弃任务的 packaged_task 随之销毁、future 立即变 `broken_promise`。原方案只写了"走 packaged_task 销毁"，但骨架代码不清队时 future 要等到**池析构**才打破、期间 `get()` 永久阻塞——已实现修正并加 test_shutdown_discard_breaks_futures 机器验证。
 - **D6（新增）每个 shard 至少一个 worker**：`num_shards > num_workers` 时无消费者的 shard 任务永不执行、drain 卡死；worker 数取 `max(num_workers, num_shards)`。
@@ -103,7 +103,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 bash scripts/build_and_test.sh   # 常规 + ASan+UBSan + TSan 三连（已修复：任一模式失败则脚本退出码非 0）
 ```
 - ASan+UBSan 模式：退出码 0，无泄漏/UB 报告；
-- TSan 模式：退出码 0，**零 WARNING**（重点盯 test_concurrent_submit_stress）；
+- TSan 模式：退出码 0，**零 WARNING**（重点盯 test_concurrent_submit_stress 与 stress_mix）；
 - 稳定性：`test_concurrent_submit_stress` 连续 20 次无一次失败（2026-10-13 本机 MinGW 已验证 20/20；WSL 待复核）；
 - 线程回收：任一测试进程结束后 `cat /proc/<pid>/status` 不可查即视为退出（或加一条"析构后 threads 全 join"断言）；
 - gdb 死锁演练笔记成文（README 已给命令，产出贴进 README「gdb 取证」节，含 `thread apply all bt` 输出摘录）。
