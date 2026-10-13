@@ -1,5 +1,5 @@
 // bounded-threadpool：有界队列线程池（单锁基线版）
-// 接口契约见 README「规格 ↔ 测试对照」；代码内 TODO(n) 与根目录 README 的日程映射。
+// 接口契约见 README「规格 ↔ 测试对照」；设计决策（D1~D7）见 README「设计决策」节。
 #pragma once
 
 #include <atomic>
@@ -80,9 +80,11 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_not_empty_;  // 队列 空->非空，唤醒 worker
     std::condition_variable cv_not_full_;   // 队列 满->非满，唤醒阻塞中的 post(kBlock)
+    std::condition_variable cv_shutdown_;   // worker 全部退出，唤醒等待排空的 shutdown(true)
     std::deque<std::function<void()>> tasks_;
-    bool closed_ = false;  // 不再接受新任务
-    bool cancel_ = false;  // drain=false 时置位，worker 立刻退出
+    bool closed_ = false;      // 不再接受新任务
+    bool cancel_ = false;      // drain=false 时置位，worker 立刻退出
+    size_t active_workers_ = 0;  // 受 mu_ 保护：尚未退出 worker_loop 的线程数
 
     std::vector<std::thread> workers_;
 
@@ -91,39 +93,52 @@ private:
     mutable std::atomic<uint64_t> rejected_{0};
 };
 
-// ---------- 模板实现（骨架阶段为 TODO 存根，实现后删除 throw） ----------
+// ---------- 模板实现 ----------
 
 template <class F>
 void ThreadPool::post(F&& f) {
-    (void)f;
-    // TODO(1) 基本提交路径：
-    //   1. std::unique_lock<std::mutex> lk(mu_);
-    //   2. 若 closed_ -> throw PoolClosedError("post on closed pool")
-    //   3. 队列满（tasks_.size() >= opts_.queue_capacity）时按 opts_.policy 处理：
-    //      kThrow     : rejected_++ 后 throw QueueFullError("queue full")
-    //      kBlock     : cv_not_full_.wait(lk, [&]{ return tasks_.size() < cap || closed_; })
-    //                   醒来后重查 closed_（应抛 PoolClosedError，想清楚语义并写进 README）
-    //      kCallerRuns: 解锁后在调用方线程直接 f()；submitted_++（completed 是否也 ++？定好语义）
-    //   4. 入队，submitted_++，cv_not_empty_.notify_one()
-    throw std::logic_error("post: not implemented");
+    std::unique_lock<std::mutex> lk(mu_);
+    if (closed_) throw PoolClosedError("post on closed pool");
+    if (tasks_.size() >= opts_.queue_capacity) {
+        switch (opts_.policy) {
+        case RejectPolicy::kThrow:
+            rejected_.fetch_add(1, std::memory_order_relaxed);
+            throw QueueFullError("queue full");
+        case RejectPolicy::kBlock:
+            // D1: 谓词含 closed_——shutdown 唤醒后重查，任务不入队不执行，抛 PoolClosedError
+            cv_not_full_.wait(lk, [&] {
+                return tasks_.size() < opts_.queue_capacity || closed_;
+            });
+            if (closed_) throw PoolClosedError("post on closed pool");
+            break;
+        case RejectPolicy::kCallerRuns:
+            // D2: caller-runs 同步执行，submitted 与 completed 都计数
+            lk.unlock();
+            submitted_.fetch_add(1, std::memory_order_relaxed);
+            std::forward<F>(f)();  // 异常自然透传给调用方（同步执行，无吞掉它的 worker）
+            completed_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    tasks_.emplace_back(std::forward<F>(f));
+    submitted_.fetch_add(1, std::memory_order_relaxed);
+    cv_not_empty_.notify_one();
 }
 
 template <class F, class... Args>
 auto ThreadPool::submit(F&& f, Args&&... args)
     -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>> {
-    (void)f;
-    (static_cast<void>(args), ...);
-    // TODO(2) 在 post 的基础上包装 packaged_task：
-    //   auto task = std::make_shared<std::packaged_task<R()>>(
-    //       [f = std::forward<F>(f),
-    //        tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-    //           return std::apply(std::move(f), std::move(tup));
-    //       });
-    //   auto fut = task->get_future();
-    //   把 [task] { (*task)(); } 作为一个普通任务走 post 路径
-    //   （任务抛异常时 packaged_task 会捕获并存入 future，worker 不受影响）
-    //   return fut;
-    throw std::logic_error("submit: not implemented");
+    using R = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>;
+    // packaged_task 只能移动，入 std::function 需套 shared_ptr；
+    // 任务抛异常时被捕获存入 future，worker 调用点不感知
+    auto task = std::make_shared<std::packaged_task<R()>>(
+        [fn = std::forward<F>(f),
+         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+            return std::apply(std::move(fn), std::move(tup));
+        });
+    auto fut = task->get_future();
+    post([task] { (*task)(); });
+    return fut;
 }
 
 }  // namespace bpool

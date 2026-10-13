@@ -1,6 +1,5 @@
 // 规格测试：每个测试对应 README「规格 ↔ 测试对照」的一条契约。
-// 骨架阶段预期全部 FAILED（not implemented）——这是 TDD 存根，不是 bug。
-// 实现完成后: ./test_pool 应输出全绿并返回 0；TSan 模式下跑无告警。
+// 通过标准: ./test_pool 输出全绿并返回 0；TSan 模式下跑无告警。
 #include "bpool/thread_pool.hpp"
 #include "bpool/sharded_pool.hpp"
 
@@ -176,11 +175,8 @@ static void test_concurrent_submit_stress() {
         std::vector<std::thread> producers;
         for (int t = 0; t < kThreads; ++t)
             producers.emplace_back([&] {
-                try {  // 骨架阶段 post 抛 not implemented，兜住防止 terminate
-                    for (int i = 0; i < kPer; ++i)
-                        pool.post([&] { sum.fetch_add(1, std::memory_order_relaxed); });
-                } catch (const std::exception&) {
-                }
+                for (int i = 0; i < kPer; ++i)
+                    pool.post([&] { sum.fetch_add(1, std::memory_order_relaxed); });
             });
         for (auto& th : producers) th.join();
     }
@@ -199,6 +195,26 @@ static void test_sharded_pool_equivalent() {
     CHECK(done.load() == 200);
 }
 
+// 11. shutdown(false) 丢弃未执行任务：对应 future 立即以 broken_promise 就绪
+static void test_shutdown_discard_breaks_futures() {
+    ThreadPool pool(one_worker(4, RejectPolicy::kBlock));
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    pool.post([gate] { gate.get(); });  // 卡住唯一 worker，保证后续任务留在队列里
+    wait_until_taken(pool);
+    pool.post([] {});                     // 占位：队列 1/4
+    auto fut = pool.submit([] { return 1; });  // 排在其后，shutdown(false) 时必被丢弃
+    pool.shutdown(false);                 // 此处就地销毁 packaged_task -> 打破 promise
+    release.set_value();                  // 放行 gate（不影响已丢弃的任务）
+    bool broke = false;
+    try {
+        (void)fut.get();  // 若实现未在 shutdown 时清队列，这里会永久阻塞（测试挂死即失败）
+    } catch (const std::future_error& e) {
+        broke = e.code() == std::future_errc::broken_promise;
+    }
+    CHECK(broke);
+}
+
 int main() {
     RUN(test_future_return_value);
     RUN(test_exception_propagates_and_pool_survives);
@@ -210,6 +226,7 @@ int main() {
     RUN(test_stats_counters);
     RUN(test_concurrent_submit_stress);
     RUN(test_sharded_pool_equivalent);
+    RUN(test_shutdown_discard_breaks_futures);
     std::printf("\ntests: %d, failed checks: %d%s\n", g_total, g_fail,
                 g_fail == 0 ? "  —— 全绿" : "");
     return g_fail ? 1 : 0;
