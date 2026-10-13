@@ -28,11 +28,13 @@ endif()
 
 function(apply_sanitizers target)
     if(BPOOL_SANITIZE)
+        # 编译插桩 PRIVATE；链接选项必须 PUBLIC——库已插桩，未插桩的消费者
+        # （如 bench_pool）也必须带上 asan/ubsan 运行时，否则 undefined reference
         target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-        target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+        target_link_options(${target} PUBLIC -fsanitize=address,undefined)
     elseif(BPOOL_TSAN)
         target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
-        target_link_options(${target} PRIVATE -fsanitize=thread)
+        target_link_options(${target} PUBLIC -fsanitize=thread)
     endif()
 endfunction()
 

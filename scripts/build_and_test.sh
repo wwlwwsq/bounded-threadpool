@@ -12,7 +12,13 @@ run_mode() {
     local dir="build/$mode"
     cmake -S . -B "$dir" -DCMAKE_BUILD_TYPE=Release "$@"
     cmake --build "$dir" -j
-    if "$dir/test_pool" && "$dir/stress_mix"; then
+    # GCC libtsan 与高熵 ASLR 内核（6.6+，WSL2 常见）不兼容，报
+    # "unexpected memory mapping"——用 setarch -R 关闭 ASLR 运行
+    local runner=()
+    if [ "$mode" = tsan ] && command -v setarch >/dev/null 2>&1; then
+        runner=(setarch "$(uname -m)" -R)
+    fi
+    if "${runner[@]}" "$dir/test_pool" && "${runner[@]}" "$dir/stress_mix"; then
         echo "== $mode: 全绿 =="
     else
         echo "== $mode: 测试未全绿 ==" >&2
