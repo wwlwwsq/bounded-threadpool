@@ -1,7 +1,6 @@
 // 吞吐基准：任务体 = 一次 atomic 自增（衡量调度开销本身，而非任务耗时）。
 // 用法: ./bench_pool [任务数]   （默认 100 万）
 // 输出 markdown 表行，直接粘进 README 的数据表。
-// 骨架阶段跑会抛 not implemented —— 实现完 TODO(1)~(13) 后再跑。
 #include "bpool/thread_pool.hpp"
 #include "bpool/sharded_pool.hpp"
 
