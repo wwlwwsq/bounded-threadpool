@@ -58,6 +58,10 @@ private:
     std::vector<std::unique_ptr<Shard>> shards_;
     std::vector<std::thread> workers_;
 
+    mutable std::mutex mu_shutdown_;        // 只保护 active_workers_，不进热路径
+    std::condition_variable cv_shutdown_;   // worker 全部退出，唤醒等待排空的 shutdown(true)
+    size_t active_workers_ = 0;
+
     std::atomic<bool> closed_{false};
     std::atomic<bool> cancel_{false};
     std::atomic<uint64_t> rr_{0};  // 轮转选片计数
@@ -67,24 +71,53 @@ private:
     std::atomic<uint64_t> rejected_{0};
 };
 
-// ---------- 模板实现（TODO 存根） ----------
+// ---------- 模板实现 ----------
 
 template <class F>
 void ShardedThreadPool::post(F&& f) {
-    (void)f;
-    // TODO(7) 与 ThreadPool::post 相同语义，但只锁目标 shard：
-    //   Shard& s = pick_shard();
-    //   后续步骤同 TODO(1)，锁与 cv 全部换成 s 的成员
-    throw std::logic_error("ShardedThreadPool::post: not implemented");
+    Shard& s = pick_shard();
+    std::unique_lock<std::mutex> lk(s.mu);
+    if (closed_.load(std::memory_order_relaxed))
+        throw PoolClosedError("post on closed pool");
+    if (s.tasks.size() >= opts_.queue_capacity) {
+        switch (opts_.policy) {
+        case RejectPolicy::kThrow:
+            rejected_.fetch_add(1, std::memory_order_relaxed);
+            throw QueueFullError("queue full");
+        case RejectPolicy::kBlock:
+            // 同 D1：谓词含 closed_，shutdown 后醒来抛 PoolClosedError
+            s.cv_not_full.wait(lk, [&] {
+                return s.tasks.size() < opts_.queue_capacity ||
+                       closed_.load(std::memory_order_relaxed);
+            });
+            if (closed_.load(std::memory_order_relaxed))
+                throw PoolClosedError("post on closed pool");
+            break;
+        case RejectPolicy::kCallerRuns:
+            lk.unlock();
+            submitted_.fetch_add(1, std::memory_order_relaxed);
+            std::forward<F>(f)();
+            completed_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    s.tasks.emplace_back(std::forward<F>(f));
+    submitted_.fetch_add(1, std::memory_order_relaxed);
+    s.cv_not_empty.notify_one();
 }
 
 template <class F, class... Args>
 auto ShardedThreadPool::submit(F&& f, Args&&... args)
     -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>> {
-    (void)f;
-    (static_cast<void>(args), ...);
-    // TODO(8) 同 ThreadPool::submit 的 packaged_task 包装，但走本类的 post
-    throw std::logic_error("ShardedThreadPool::submit: not implemented");
+    using R = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>;
+    auto task = std::make_shared<std::packaged_task<R()>>(
+        [fn = std::forward<F>(f),
+         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+            return std::apply(std::move(fn), std::move(tup));
+        });
+    auto fut = task->get_future();
+    post([task] { (*task)(); });
+    return fut;
 }
 
 }  // namespace bpool
