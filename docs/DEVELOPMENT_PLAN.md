@@ -150,10 +150,11 @@ bash scripts/build_and_test.sh   # 常规 + ASan+UBSan + TSan 三连（已修复
 
 | 风险 | 概率 | 预案 |
 |---|---|---|
-| 时序类测试 flaky（backpressure/caller-runs） | 中 | 已用 promise-gate 门控确定性；仍 flaky 就把 sleep 换成条件轮询，禁用"加大 sleep"这种糊法 |
+| 时序类测试 flaky（backpressure/caller-runs） | 中 | 已用 promise-gate 门控确定性；仍 flaky 就把 sleep 换成条件轮询，禁用"加大 sleep"这种糊法（gdb demo 也因此从 sleep 版改为双向原子门控版） |
 | 分片在笔记本上无提升 | 中高 | 属合法负结论：加任务负载（每任务多几次原子加）或提升任务数到 200 万再测；仍无则写归因 |
-| WSL2 perf 不可用 | 中 | 换 valgrind --tool=callgrind（注明等价性）；或物理机/云主机跑取证 |
-| TSan 报唤醒丢失/虚假唤醒 | 低 | 检查是否全部用谓词 wait；notify 在持锁/放锁后均可，但要保证修改谓词与 notify 不重排出错 |
+| WSL2 perf 不可用 | 中 | 换 valgrind --tool=callgrind（注明等价性）；或物理机/云主机跑取证（perf 另需容器/环境放开 CAP_PERFMON） |
+| GCC libtsan 与高熵 ASLR 内核不兼容（"unexpected memory mapping"，WSL2 6.6+ 常见） | 已兑现 | build_and_test.sh 已内置：TSan 二进制经 `setarch -R`（关 ASLR）运行；容器环境需 seccomp 放开 personality 调用 |
+| **pop 后条件化 notify 丢唤醒** | 已兑现 | 「仅满队才 notify_one」在多提交者堆积+队列排空时死锁，stress_mix 首轮捕获；定稿为每 pop 无条件 notify_one（D3 已改写） |
 | 时间超支 | 中 | 优先级：M1–M3 硬关卡 > M4 完整矩阵 > M5 文案；§6 加分项全砍 |
 
 ---

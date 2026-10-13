@@ -79,28 +79,58 @@ g++ -std=c++17 -O1 -g -fsanitize=undefined -fsanitize-undefined-trap-on-error -p
 
 ## gdb 取证：制造并定位一次死锁（面试弹药）
 
-```bash
-cat > /tmp/deadlock.cpp <<'EOF'
-#include <chrono>
+demo 用**双向原子门控**保证确定性互等（纯 sleep 版在高负载机器上会走样）：
+
+```cpp
+// deadlock_demo.cpp
+#include <atomic>
 #include <mutex>
 #include <thread>
 int main() {
     std::mutex a, b;
+    std::atomic<bool> t_has_a{false}, main_has_b{false};
     std::thread t([&] {
         std::lock_guard<std::mutex> x(a);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        std::lock_guard<std::mutex> y(b);
+        t_has_a.store(true);
+        while (!main_has_b.load()) std::this_thread::yield();
+        std::lock_guard<std::mutex> y(b);   // 持 a 等 b（此刻 b 确已被主线程持有）
     });
+    while (!t_has_a.load()) std::this_thread::yield();
     std::lock_guard<std::mutex> y(b);
-    std::lock_guard<std::mutex> x(a);
+    main_has_b.store(true);
+    std::lock_guard<std::mutex> x(a);       // 持 b 等 a —— 互等死锁
     t.join();
 }
-EOF
-g++ -g -O0 /tmp/deadlock.cpp -o /tmp/deadlock -pthread && /tmp/deadlock
-# 卡住后另开终端:
-gdb -p $(pidof deadlock)
-(gdb) thread apply all bt    # 两个线程互相持锁等待 —— 这就是「熟练 gdb」的故事素材
 ```
+
+```bash
+g++ -g -O0 deadlock_demo.cpp -o deadlock -pthread && ./deadlock   # 永久卡住
+# 另开终端:
+gdb -p $(pidof deadlock)
+(gdb) thread apply all bt
+```
+
+实测输出摘录（Ubuntu 24.04 / gdb 15.1，2026-10-13）——两线程各自阻塞在
+`pthread_mutex_lock` 的 futex 上，**等的正好是对方持有的那把锁**：
+
+```text
+Thread 2 (LWP 3898):
+#0  futex_wait (futex_word=0x7fff91238170 ...)          <- 等 mutex b
+#3  ___pthread_mutex_lock (mutex=0x7fff91238170)
+#7  operator() (...) at deadlock_demo.cpp:14            <- lock_guard y(b)
+
+Thread 1 (LWP 3896):
+#0  futex_wait (futex_word=0x7fff91238140 ...)          <- 等 mutex a
+#3  ___pthread_mutex_lock (mutex=0x7fff91238140)
+#7  main () at deadlock_demo.cpp:19                     <- lock_guard x(a)
+```
+
+判读要点：两个 futex 地址不同（两把不同的锁）；每个线程都在 `lll_lock_wait`
+（锁被持有者睡眠等待）；对照源码行号即得「持 a 等 b / 持 b 等 a」的互等闭环。
+解法是统一加锁顺序或 `std::scoped_lock(a, b)`（内部死锁避免）。
+
+> Windows/MinGW 旁注：本机 i686 gdb 可附加并 `thread apply all bt` 列出线程，
+> 但栈回溯穿过系统 DLL 边界时断裂，用户态持锁帧不可见——符号化取证请用 Linux/WSL。
 
 ## 简历 bullet（数据跑出来再填，别提前写）
 
