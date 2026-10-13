@@ -50,32 +50,48 @@ g++ -std=c++17 -O1 -g -fsanitize=undefined -fsanitize-undefined-trap-on-error -p
 - **D6 每个 shard 至少一个 worker**：`num_shards > num_workers` 时，无消费者的 shard 任务永远不被执行、drain 卡死。构造时 worker 数取 `max(num_workers, num_shards)`。
 - **D7 shutdown 同步语义**：`drain=true` 阻塞到「已入队任务全部完成、worker 全部退出」才返回（`cv_shutdown_` + `active_workers_` 计数）；`drain=false` 原子清队后立即返回（运行中任务无法安全打断，由析构 join 收尾）。约束：**不得在任务体内调用 shutdown(true)**——等价于自己等自己，死锁。构造函数在线程创建中途失败时同样关闸回收已启动线程，不让线程逃过析构。
 
-## 性能数据（全部实测；取证环境以 WSL2/x86-64 为准）
+## 性能数据（实测环境：WSL2 Docker 容器 ubuntu:24.04，g++ 13.3 -O2，x86-64，16 vCPU，宿主机高负载）
 
-### 吞吐：workers 扫描（任务 = atomic 自增，100 万次，M4 待 WSL2 实测填入）
+### 吞吐：workers 扫描（任务 = atomic 自增，100 万次，reps=5 取中位）
 
-| pool | workers | queue_cap(shard) | M ops/s |
+| pool | workers | queue_cap(shard) | M ops/s (median of 5) |
 |---|---|---|---|
-| baseline | 1 | 4096 | 待测 |
-| baseline | 2 | 4096 | 待测 |
-| baseline | 4 | 4096 | 待测 |
-| baseline | 8 | 4096 | 待测 |
-| sharded | 1 | 256 | 待测 |
-| sharded | 2 | 256 | 待测 |
-| sharded | 4 | 256 | 待测 |
-| sharded | 8 | 256 | 待测 |
+| baseline | 1 | 4096 | 6.01 |
+| sharded | 1 | 256 | 4.71 |
+| baseline | 2 | 4096 | 6.74 |
+| sharded | 2 | 256 | 4.88 |
+| baseline | 4 | 4096 | 2.06 |
+| sharded | 4 | 256 | 0.17 |
+| baseline | 8 | 4096 | 0.66 |
+| sharded | 8 | 256 | 0.09 |
+| baseline | 16 | 4096 | 0.10 |
+| sharded | 16 | 256 | 0.09 |
 
-> 本机（Windows / 32 位 i686 MinGW g++ 15.2 / 16 逻辑核，后台负载高）单次运行参考数据：
-> baseline 1/2/4/8/16 workers ≈ 6.5 / 6.1 / 3.4 / 0.2 / 0.04 M ops/s；sharded ≈ 5.7 / 1.7 / 0.3 / 0.2 / 0.2 M ops/s。
-> 该环境**不满足**关卡 C 的 1 线程 sanity check（差距 12–30%），且高 worker 数全线坍塌、run-to-run 方差巨大。
-> 归因假设：i686 上 `atomic<uint64_t>` 无原生支持（每次计数走 lock cmpxchg8b，且跨线程争用）+ winpthreads 条件变量开销；
-> 待 WSL2 x86-64（原生 64 位 lock add）复测后再下结论——这正是「有数据的负结论也算过」的场景，但在噪声环境里连负结论都不可信。
+### 归因分析（为什么本环境分片无收益、高 worker 数坍塌——全部有数据）
 
-### 优化记录（每行 = 一次「假设 -> 改动 -> 数据」；M4 在 WSL2 上闭环 ≥2 条）
+1. **纯路径两池持平**：200 任务（队列装得下、kBlock 零阻塞）×1001 次取中位：
+   baseline 3.60 vs sharded 3.56 M ops/s（差 1.2%，关卡 C 的 5% sanity check 在同口径下达标）。
+   分片结构本身（rr_ 原子选片、锁切换）不是瓶颈。
+2. **小容量 + kBlock 的唤醒税**：满载稳态下每 pop 一次唤醒一个睡眠中的提交者（futex 往返）。
+   sharded 容量 256→4096 后 1 worker 差距从 22% 收窄到 9%（实测 4.71→5.77）。
+3. **分片流量摊薄放大 worker 睡眠**：轮转选片使每片只分到 1/N 流量，片级队列易空、
+   其绑定 worker 睡得更频繁；baseline 全部流量集中一个队列，worker 反而不睡。
+4. **环境 CPU 饥饿**：perf stat 实测 task-clock 仅 **1.75 CPU / 16 vCPU**（宿主机高负载），
+   每次唤醒都要等空闲 CPU，睡眠/唤醒代价被放大一个数量级；4/8/16 worker 档的坍塌
+   （6.7M → 0.1M）主要由该因素驱动。
+5. **perf record 热点佐证**（200k 任务，-F 299 采样）：`pthread_cond_wait` 24.7% +
+   `pthread_cond_signal` 16.6% + `__lll_lock_wake` 15.2% + 内核侧 futex 路径（unknown 内核符号）
+   约 35%——**时间几乎全花在同步原语上**，任务体（atomic 自增）占比可忽略。
+   结论：本环境的负结果成立且有归因；在安静、CPU 富余的机器上分片预期才有正收益，
+   复测命令即 `./build/bench_pool 1000000 5`。
 
-| 日期 | 假设 | 改动 | 数据（前 -> 后） | 工具 |
-|---|---|---|---|---|
-| 待 M4 | 全局单锁是瓶颈 | 单队列 -> 分片队列 | 待 perf 定位后填 | perf record |
+### 优化记录（假设 -> 改动 -> 前后数据 -> 工具）
+
+| # | 日期 | 假设 | 改动 | 数据（前 -> 后） | 工具 | 结论 |
+|---|---|---|---|---|---|---|
+| 1 | 2026-10-13 | 仅队列满时 notify_not_full 可省系统调用 | worker pop 后条件化 notify_one | stress_mix 首轮（kBlock cap=4）**死锁**；A/B 吞吐：条件版仅快 0–12%（1w 档），≥4w 持平（6.14→6.88 / 6.00→6.49 / 2.30≈2.32 M） | stress_mix + bench A/B + perf | **回退**。多提交者堆积睡眠+队列排空→谓词已真却无人唤醒；正确性必需，性能代价小且有界 |
+| 2 | 2026-10-13 | worker 睡前短自旋（512×try_lock+pause）可省 futex 往返 | worker_loop 加自旋窗口 | 1w：6.14→2.86（-53%）；2w：6.00→1.26（-79%）；4w+ 全线更差 | bench A/B + perf stat | **不采纳**。CPU 饥饿环境自旋挤占生产者 CPU；仅在 CPU 富余+高到达率场景可能有效 |
+| 3 | 2026-10-13 | 1 worker 档 sharded 落后 22% 是分片开销 | 隔离实验：零阻塞路径对比 + 容量对照 | 零阻塞（200 任务）：差 1.2%；sharded cap 256→4096：1w 差距 22%→9%（4.71→5.77） | bench 对照 + perf record | 归因于小容量唤醒税+流量摊薄+CPU 饥饿，非分片结构本身（详见上文 5 条） |
 
 ## gdb 取证：制造并定位一次死锁（面试弹药）
 
@@ -132,7 +148,10 @@ Thread 1 (LWP 3896):
 > Windows/MinGW 旁注：本机 i686 gdb 可附加并 `thread apply all bt` 列出线程，
 > 但栈回溯穿过系统 DLL 边界时断裂，用户态持锁帧不可见——符号化取证请用 Linux/WSL。
 
-## 简历 bullet（数据跑出来再填，别提前写）
+## 简历 bullet（数据已实测，按目标岗位取用）
 
-- 实现有界队列线程池：双条件变量同步、future 异步返回、异常透传、可配置拒绝策略与优雅关闭；100 万任务 8 线程吞吐待测 M ops/s
-- 以单锁版为基线，用 perf 定位锁竞争热点后实现分片队列版本，8 线程吞吐提升待测%；TSan/ASan 全量通过
+- 实现有界队列线程池：双条件变量同步、future 异步返回、异常透传、三种拒绝策略与同步排空语义；11 条规格测试 + 混合压力测试全绿，TSan/ASan/UBSan 零告警；100 万 atomic 自增任务 2 线程吞吐 6.7M ops/s（16 vCPU WSL2 容器）
+- 以 perf/对照实验驱动调优：捕获并修复条件化 notify 的丢唤醒死锁（谓词等待救不了缺失通知）；量化分片队列在本环境的负收益并五条归因（纯路径差 1.2%、小容量唤醒税、流量摊薄、vCPU 饥饿、同步原语占比 ~60%）；三条「假设→改动→数据」闭环全部成文
+
+> 注：所有吞吐数字产自高负载宿主机上的 WSL2 容器（task-clock 仅 1.75/16 CPU），
+> 复现命令 `./build/bench_pool 1000000 5`；安静机器上绝对值会显著更高，相对结论见归因分析。

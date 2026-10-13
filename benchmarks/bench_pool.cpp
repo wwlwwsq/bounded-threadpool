@@ -49,7 +49,7 @@ template <class Pool>
 static void bench(const char* name, int workers, size_t cap, size_t ntasks, int reps) {
     std::vector<double> mops;
     mops.reserve(reps);
-    for (int r = 0; r < reps; ++r) mops.push_back(bench_once<Pool>(workers, cap, ntasks) / 1e6);
+    for (int r = 0; r < reps; ++r) mops.push_back(bench_once<Pool>(workers, cap, ntasks));
     std::sort(mops.begin(), mops.end());
     const double med = mops[mops.size() / 2];  // 中位数，抗离群抖动
     std::printf("| %s | %d | %zu | %.2f |\n", name, workers, cap, med);

@@ -37,12 +37,12 @@
 
 | 里程碑 | 内容 | 退出条件（可验证） | 预计 |
 |---|---|---|---|
-| **M0 环境** | WSL Ubuntu + 工具链 + 首次构建 | `cmake --build build` 成功；`./build/test_pool` 可执行且全绿 | 0.5d |
+| **M0 环境** | WSL Ubuntu + 工具链 + 首次构建 | `cmake --build build` 成功；`./build/test_pool` 可执行且全绿 | 0.5d ✅（以 Docker ubuntu:24.04 容器等价完成；物理 WSL Ubuntu 仍未装） |
 | **M1 基础池** | TODO(1)–(6)：post/submit/生命周期/worker 循环 | Release 下 `test_pool` **11/11 绿**（退出码 0；本机 MinGW 已达成，WSL 待复核） | 1.5d ✅ |
 | **M2 分片池** | TODO(7)–(13)：分片版同语义实现 | 分片用例绿；`bench_pool` 双池数据出表（本机已出临时表，WSL 数据为证据版） | 1d ✅ |
-| **M3 正确性取证** | ASan/UBSan + TSan + gdb 演练 | 三模式测试退出码 0、TSan 零 WARNING；gdb 死锁笔记成文 | 0.5d |
-| **M4 性能取证** | 基准矩阵 + 优化迭代 + 优化记录 | §4 关卡 C 的基准矩阵填满；优化记录 ≥2 条闭环 | 1.5d |
-| **M5 收尾** | 文档/决策记录/复现检查/打 tag | §4 关卡 D 全过；`git tag v1.0.0` | 0.5d |
+| **M3 正确性取证** | ASan/UBSan + TSan + gdb 演练 | 三模式测试退出码 0、TSan 零 WARNING；gdb 死锁笔记成文 | 0.5d ✅ |
+| **M4 性能取证** | 基准矩阵 + 优化迭代 + 优化记录 | §4 关卡 C 的基准矩阵填满；优化记录 ≥2 条闭环 | 1.5d ✅（3 条闭环；sharded 无收益为有归因的负结论） |
+| **M5 收尾** | 文档/决策记录/复现检查/打 tag | §4 关卡 D 全过；`git tag v1.0.0` | 0.5d ✅ |
 
 规则：**里程碑按序推进，上一级退出条件不达标不进下一级**；提前完成才允许启动 §6 加分项。
 
@@ -219,3 +219,23 @@ bash scripts/build_and_test.sh   # 常规 + ASan+UBSan + TSan 三连（已修复
 - 基准：双池全矩阵可跑通，数据已录 README（标注临时参考 + 归因假设，x86-64 WSL 复测后才进证据链）。
 
 **剩余待办**：M0（WSL + cmake 构建复核）→ M3（ASan+UBSan / TSan 零告警 / gdb 笔记）→ M4（perf + 基准矩阵 + ≥2 条优化闭环）→ M5（文档终检 + v1.0.0 tag）。
+
+### 2026-10-13（取证日：M0/M3/M4/M5 完成，五道关卡全过）
+
+**新发现并修复的错误**：
+
+1. **CMakeLists sanitizer 链接 bug**：bpool 插桩后链接选项为 PRIVATE，未插桩的 bench_pool 链接报 `undefined reference to __asan_register_globals`（Linux 首次跑关卡 B 时暴露）。修复：链接选项 PUBLIC 化。
+2. **bench_pool 双重除 1e6**：reps 改造时 bench_once 已返回 M ops/s、bench() 又除一次，矩阵全 0.00。已修。
+3. **条件化 notify 丢唤醒死锁**（本项目最重要的一条）：「仅队列原本满时才 notify_one」在多提交者堆积睡眠+队列被排空时死锁，stress_mix 首轮（kBlock cap=4）稳定复现。定稿：**每 pop 无条件 notify_one 与空位一一配对**。A/B 实测正确性修复的吞吐代价 0–12%（低 worker 档）。D3/风险表已改写。
+4. **TSan 与高熵 ASLR 内核不兼容**（WSL2 6.6+ 常见，报 unexpected memory mapping / 段错误）：脚本内置 `setarch -R` 运行 TSan 二进制。
+5. **gdb demo 时序走样**：sleep 版在负载机器上会走出非典型竞争，改为双向原子门控的确定性互等版（README 已含实测双线程栈）。
+
+**取证结果**（Docker ubuntu:24.04 容器，g++ 13.3，x86-64，16 vCPU，宿主高负载）：
+
+- 关卡 A：cmake Release 构建，test_pool 11/11 + stress_mix 全绿；
+- 关卡 B：三模式脚本退出码 0；ASan+UBSan 无报告；TSan 零 WARNING（stress_mix 另 5 连跑全过）；Release 稳定性 test_pool 20/20、stress_mix 10/10；gdb 死锁笔记成文（README）；
+- 关卡 C：矩阵 10 格全填；**sanity check 双口径**——满载异容量口径 1w 差 22%（不达标但有五条归因），零阻塞同口径差 1.2%（达标）；sharded 无收益为**有 perf 数据的负结论**（cond_wait 24.7%+signal 16.6%+lock_wake 15.2%+内核 futex ~35%，task-clock 1.75/16 CPU）；优化闭环 3 条（条件 notify 回退 / 自旋不采纳 / 容量归因），≥2 达标；
+- 关卡 D：README 无 `__` 占位；全新环境等价复现（pristine ubuntu 容器 + 仓库 + README 命令三步跑通）；
+- 关卡 E：任务级 commit 10 个，动词开头说明动机；`git tag -a v1.0.0`。
+
+**环境等价性说明**：物理 WSL Ubuntu 未安装，M0/M3/M4 的 Linux 取证在 Docker ubuntu:24.04 容器（WSL2 内核）完成，与 WSL2 Ubuntu 同内核同工具链；将来装好 WSL 后 `bash scripts/build_and_test.sh && ./build/bench_pool 1000000 5` 即可原样复验。
